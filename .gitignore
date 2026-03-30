@@ -1,0 +1,6 @@
+.venv
+.idea
+.env
+data
+__pycache__
+database/docstores/*
