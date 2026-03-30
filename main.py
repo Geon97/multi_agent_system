@@ -133,8 +133,8 @@ def run(user_input):
 
 
 if __name__ == "__main__":
-    # 这里保留一个典型的政策咨询示例，便于本地手动运行。
-    user_input = "某项政策是否适用于我当前的情况？如果适用，我应该如何准备后续动作？"
+    # 知识库研究助手
+    user_input = "对比古城区拆迁补贴政策和安置政策的差异。"
     output = run(user_input)
     print("\n================ 最终结果 ================\n")
     print(output)
