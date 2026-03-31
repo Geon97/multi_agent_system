@@ -19,14 +19,25 @@ DEFAULT_PARENT_CHUNK_OVERLAP = 200
 DEFAULT_CHILD_CHUNK_SIZE = 500
 DEFAULT_CHILD_CHUNK_OVERLAP = 100
 
+
+def _build_source_relationship(doc_id: str, file_name: str) -> RelatedNodeInfo:
+    """为节点补充文档来源关系，避免脱离 docstore 后 ref_doc_id 丢失。"""
+
+    return RelatedNodeInfo(
+        node_id=doc_id,
+        metadata={"file_name": file_name},
+    )
+
 def _clean_text(text: str) -> str:
     """清理文本，去掉 &nbsp;、多余空格、空行和无效 Markdown"""
     text = text.replace("&nbsp;", " ")
     text = re.sub(r"[ \t]+", " ", text)  # 多空格换成单空格
     text = re.sub(r"\n\s*\n+", "\n\n", text)  # 多空行换成双换行
     text = text.strip()
-    # 去掉只包含 Markdown 标题或分隔符的无效行
-    if re.fullmatch(r"[#\-\*\s]+", text):
+    # 去掉 Markdown 标题前缀
+    text = re.sub(r"^#+\s*", "", text)  # 去掉开头的 # 或 ## ###
+    # 去掉只包含分隔符的行
+    if re.fullmatch(r"[-\*\s]+", text):
         return ""
     return text
 
@@ -164,8 +175,19 @@ def _build_parent_child_nodes(
     child_nodes: list[TextNode] = []
 
     for document in documents:
-        doc_id = document.doc_id or document.metadata.get("file_name", "document")
-        doc_metadata = {"file_name": doc_id}
+        doc_id = document.doc_id
+        if not doc_id or doc_id == "None":
+            doc_id = document.metadata.get("file_name", "document")
+        file_name = document.metadata.get("file_name", doc_id)
+        doc_metadata = {
+            "file_name": file_name,
+            "source_path": document.metadata.get("source_path"),
+            "document_id": doc_id,
+            "doc_id": doc_id,
+            "ref_doc_id": doc_id,
+        }
+        doc_metadata = {key: value for key, value in doc_metadata.items() if value is not None}
+        source_relationship = _build_source_relationship(doc_id, file_name)
 
         doc_parent_nodes: list[TextNode] = []
 
@@ -183,6 +205,7 @@ def _build_parent_child_nodes(
                     "parent_chunk_index": parent_index,
                 },
             )
+            parent_node.relationships[NodeRelationship.SOURCE] = source_relationship
 
             sibling_child_nodes: list[TextNode] = []
 
@@ -202,6 +225,7 @@ def _build_parent_child_nodes(
                         "child_chunk_index": child_index,
                     },
                 )
+                child_node.relationships[NodeRelationship.SOURCE] = source_relationship
                 child_node.relationships[NodeRelationship.PARENT] = RelatedNodeInfo(
                     node_id=parent_id
                 )
@@ -311,8 +335,8 @@ def ingest_collection(
 if __name__ == "__main__":
     client = get_qdrant_client()
     embed_model = get_embedding_model()
-    data_dir = Path(r"C:\Users\Geon\Downloads\policy_documents")
-    collection_name = "policy_documents"
+    data_dir = Path(r"C:\Users\Geon\Downloads\policy_interpretations")
+    collection_name = "policy_interpretations"
     summary = ingest_collection(
         collection_name=collection_name,
         data_dir=data_dir,
