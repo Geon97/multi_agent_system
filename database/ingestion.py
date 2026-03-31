@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable, Sequence
 from uuid import NAMESPACE_URL, uuid5
@@ -7,15 +8,10 @@ from uuid import NAMESPACE_URL, uuid5
 from llama_index.core import Document
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
-from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client.http.models import Distance, VectorParams
 
 from config import get_embedding_model, get_qdrant_client
-
-# 默认 docstore 文件名和存储路径
-DOCSTORE_FILENAME = "docstore.json"
-DEFAULT_DOCSTORE_BASE_DIR = Path(__file__).resolve().parent / "docstores"
 
 # 默认父子分块大小和重叠
 DEFAULT_PARENT_CHUNK_SIZE = 2000
@@ -23,6 +19,16 @@ DEFAULT_PARENT_CHUNK_OVERLAP = 200
 DEFAULT_CHILD_CHUNK_SIZE = 500
 DEFAULT_CHILD_CHUNK_OVERLAP = 100
 
+def _clean_text(text: str) -> str:
+    """清理文本，去掉 &nbsp;、多余空格、空行和无效 Markdown"""
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"[ \t]+", " ", text)  # 多空格换成单空格
+    text = re.sub(r"\n\s*\n+", "\n\n", text)  # 多空行换成双换行
+    text = text.strip()
+    # 去掉只包含 Markdown 标题或分隔符的无效行
+    if re.fullmatch(r"[#\-\*\s]+", text):
+        return ""
+    return text
 
 def _make_qdrant_safe_id(raw_id: str) -> str:
     """
@@ -66,16 +72,6 @@ def _build_splitter(chunk_size: int, chunk_overlap: int):
         length_function=len,
         separators=["\n\n", "\n", " ", ""],
     )
-
-
-def get_docstore_persist_path(
-    collection_name: str,
-    base_dir: str | Path | None = None,
-) -> Path:
-    """获取当前集合对应的 docstore 持久化路径。"""
-
-    root = Path(base_dir) if base_dir is not None else DEFAULT_DOCSTORE_BASE_DIR
-    return root / collection_name / DOCSTORE_FILENAME
 
 
 def _read_documents(data_dir: str | Path) -> list[Document]:
@@ -123,13 +119,20 @@ def _link_siblings(nodes: Sequence[TextNode]) -> None:
 
 def _split_non_empty(splitter, text: str) -> list[str]:
     """只保留非空分块。"""
-
-    return [chunk for chunk in splitter.split_text(text) if chunk.strip()]
+    chunks = [chunk.strip() for chunk in splitter.split_text(text)]
+    # 只保留长度 > 5 或有中文/英文字符的块
+    filtered_chunks = [
+        chunk for chunk in chunks
+        if len(chunk) > 5 or re.search(r'[\u4e00-\u9fffA-Za-z0-9]', chunk)
+    ]
+    return filtered_chunks
 
 
 def _build_parent_child_nodes(
-    documents: Iterable[Document],
+    documents: Iterable,
     *,
+    parent_splitter=None,
+    child_splitter=None,
     parent_chunk_size: int = DEFAULT_PARENT_CHUNK_SIZE,
     parent_chunk_overlap: int = DEFAULT_PARENT_CHUNK_OVERLAP,
     child_chunk_size: int = DEFAULT_CHILD_CHUNK_SIZE,
@@ -142,19 +145,32 @@ def _build_parent_child_nodes(
     子节点用于向量化检索。
     """
 
-    parent_splitter = _build_splitter(parent_chunk_size, parent_chunk_overlap)
-    child_splitter = _build_splitter(child_chunk_size, child_chunk_overlap)
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    parent_splitter = parent_splitter or RecursiveCharacterTextSplitter(
+        chunk_size=parent_chunk_size,
+        chunk_overlap=parent_chunk_overlap,
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    child_splitter = child_splitter or RecursiveCharacterTextSplitter(
+        chunk_size=child_chunk_size,
+        chunk_overlap=child_chunk_overlap,
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""]
+    )
 
     parent_nodes: list[TextNode] = []
     child_nodes: list[TextNode] = []
 
     for document in documents:
-        doc_id = document.doc_id or "document"
-        doc_metadata = dict(document.metadata)
+        doc_id = document.doc_id or document.metadata.get("file_name", "document")
+        doc_metadata = {"file_name": doc_id}
+
         doc_parent_nodes: list[TextNode] = []
 
         for parent_index, parent_chunk in enumerate(
-            _split_non_empty(parent_splitter, document.text)
+                _split_non_empty(parent_splitter, _clean_text(document.text))
         ):
             raw_parent_id = f"{doc_id}:parent:{parent_index}"
             parent_id = _make_qdrant_safe_id(raw_parent_id)
@@ -163,8 +179,6 @@ def _build_parent_child_nodes(
                 text=parent_chunk,
                 metadata={
                     **doc_metadata,
-                    "doc_id": doc_id,
-                    "raw_node_id": raw_parent_id,
                     "chunk_level": "parent",
                     "parent_chunk_index": parent_index,
                 },
@@ -173,7 +187,7 @@ def _build_parent_child_nodes(
             sibling_child_nodes: list[TextNode] = []
 
             for child_index, child_chunk in enumerate(
-                _split_non_empty(child_splitter, parent_chunk)
+                    _split_non_empty(child_splitter, _clean_text(parent_chunk))
             ):
                 raw_child_id = f"{raw_parent_id}:child:{child_index}"
                 child_id = _make_qdrant_safe_id(raw_child_id)
@@ -182,11 +196,8 @@ def _build_parent_child_nodes(
                     text=child_chunk,
                     metadata={
                         **doc_metadata,
-                        "doc_id": doc_id,
-                        "raw_node_id": raw_child_id,
                         "chunk_level": "child",
                         "parent_node_id": parent_id,
-                        "raw_parent_node_id": raw_parent_id,
                         "parent_chunk_index": parent_index,
                         "child_chunk_index": child_index,
                     },
@@ -196,7 +207,16 @@ def _build_parent_child_nodes(
                 )
                 sibling_child_nodes.append(child_node)
 
-            _link_siblings(sibling_child_nodes)
+            # 链接兄弟节点
+            for idx, node in enumerate(sibling_child_nodes):
+                if idx > 0:
+                    node.relationships[NodeRelationship.PREVIOUS] = RelatedNodeInfo(
+                        node_id=sibling_child_nodes[idx - 1].node_id
+                    )
+                if idx + 1 < len(sibling_child_nodes):
+                    node.relationships[NodeRelationship.NEXT] = RelatedNodeInfo(
+                        node_id=sibling_child_nodes[idx + 1].node_id
+                    )
 
             parent_node.relationships[NodeRelationship.CHILD] = [
                 RelatedNodeInfo(node_id=node.node_id) for node in sibling_child_nodes
@@ -205,7 +225,17 @@ def _build_parent_child_nodes(
             doc_parent_nodes.append(parent_node)
             child_nodes.extend(sibling_child_nodes)
 
-        _link_siblings(doc_parent_nodes)
+        # 链接父节点兄弟
+        for idx, node in enumerate(doc_parent_nodes):
+            if idx > 0:
+                node.relationships[NodeRelationship.PREVIOUS] = RelatedNodeInfo(
+                    node_id=doc_parent_nodes[idx - 1].node_id
+                )
+            if idx + 1 < len(doc_parent_nodes):
+                node.relationships[NodeRelationship.NEXT] = RelatedNodeInfo(
+                    node_id=doc_parent_nodes[idx + 1].node_id
+                )
+
         parent_nodes.extend(doc_parent_nodes)
 
     return parent_nodes, child_nodes
@@ -217,14 +247,13 @@ def ingest_collection(
     *,
     client=None,
     embed_model=None,
-    docstore_base_dir: str | Path | None = None,
     parent_chunk_size: int = DEFAULT_PARENT_CHUNK_SIZE,
     parent_chunk_overlap: int = DEFAULT_PARENT_CHUNK_OVERLAP,
     child_chunk_size: int = DEFAULT_CHILD_CHUNK_SIZE,
     child_chunk_overlap: int = DEFAULT_CHILD_CHUNK_OVERLAP,
 ) -> dict[str, str | int]:
     """
-    将指定目录的文档插入到 Qdrant 向量库和本地 Docstore。
+    将指定目录的文档插入到 Qdrant 向量库
 
     - 父节点用于文档层级聚合
     - 子节点用于向量化检索
@@ -261,21 +290,13 @@ def ingest_collection(
         vector_store=vector_store,
         transformations=[embed_model],
     )
-    ingestion_pipeline.run(nodes=child_nodes)
-
-    docstore = SimpleDocumentStore()
-    docstore.add_documents([*parent_nodes, *child_nodes], store_text=True)
-
-    docstore_path = get_docstore_persist_path(collection_name, docstore_base_dir)
-    docstore_path.parent.mkdir(parents=True, exist_ok=True)
-    docstore.persist(persist_path=str(docstore_path))
+    ingestion_pipeline.run(nodes=child_nodes)  # 只插入向量化子节点
 
     summary = {
         "collection_name": collection_name,
         "document_count": len(documents),
         "parent_node_count": len(parent_nodes),
         "leaf_node_count": len(child_nodes),
-        "docstore_path": str(docstore_path),
     }
     print(
         "[INFO] ingestion 完成:",

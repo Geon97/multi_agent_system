@@ -134,7 +134,7 @@ def run(user_input):
 
 if __name__ == "__main__":
     # 知识库研究助手
-    user_input = "对比古城区拆迁补贴政策和安置政策的差异。"
+    user_input = "拆迁补贴政策和安置政策的差异。"
     output = run(user_input)
     print("\n================ 最终结果 ================\n")
     print(output)
